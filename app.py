@@ -319,20 +319,19 @@ def preflight_fichier():
 @app.route('/analyser-fichier', methods=['POST'])
 def analyser_fichier():
     """
-    Reçoit directement le texte brut d'un fichier CSV (colonnes Date, Montant —
-    voir Gabarit_Diagnostic_Flash.csv) et fait tout le travail ici : parsing,
-    détection de colonne, calcul de tendance. Pensé pour être appelé depuis un
-    scénario Make sans logique de parsing côté no-code.
-    Corps attendu : {"csv_text": "Date,Montant\\n2026-01-01,450000\\n...", "n_prevision": 3}
+    Reçoit directement le texte BRUT d'un fichier CSV dans le corps de la requête
+    (Content-Type: text/plain ou text/csv — pas de JSON), colonnes Date, Montant
+    (voir Gabarit_Diagnostic_Flash.csv). Fait tout le travail ici : parsing,
+    détection de colonne, calcul de tendance. Pensé pour un appel HTTP direct
+    depuis Make, sans logique de parsing côté no-code.
+    Paramètre optionnel en query string : ?n_prevision=3
     """
-    payload = request.get_json(force=True, silent=True) or {}
-    csv_text = payload.get('csv_text', '')
+    csv_text = request.get_data(as_text=True) or ''
     if not csv_text.strip():
-        return jsonify({'erreur': "Aucun contenu de fichier reçu (champ 'csv_text' vide)."}), 400
+        return jsonify({'erreur': "Aucun contenu de fichier reçu (corps de requête vide)."}), 400
 
-    n_prevision = payload.get('n_prevision', 3)
     try:
-        n_prevision = max(1, min(int(n_prevision), 12))
+        n_prevision = max(1, min(int(request.args.get('n_prevision', 3)), 12))
     except (TypeError, ValueError):
         n_prevision = 3
 
