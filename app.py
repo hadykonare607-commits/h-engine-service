@@ -253,6 +253,9 @@ def analyser_serie():
     payload = request.get_json(force=True, silent=True) or {}
     serie = payload.get('serie') or []
     valeurs = [p.get('value') for p in serie if isinstance(p.get('value'), (int, float))]
+    if not valeurs and payload.get('valeurs'):
+        # Format simplifié : {"valeurs": [1200, 1300, ...]} — pratique depuis Make/no-code
+        valeurs = [float(v) for v in payload.get('valeurs', []) if isinstance(v, (int, float, str)) and str(v).strip() != '']
     n = len(valeurs)
     n_prevision = payload.get('n_prevision', 3)
     try:
