@@ -248,26 +248,23 @@ def decomposition_saisonniere_additive(valeurs, periode=12, n_prevision=3):
     }
 
 
-@app.route('/analyser-serie', methods=['POST'])
-def analyser_serie():
-    payload = request.get_json(force=True, silent=True) or {}
-    serie = payload.get('serie') or []
-    valeurs = [p.get('value') for p in serie if isinstance(p.get('value'), (int, float))]
-    if not valeurs and payload.get('valeurs'):
-        # Format simplifié : {"valeurs": [1200, 1300, ...]} — pratique depuis Make/no-code
-        valeurs = [float(v) for v in payload.get('valeurs', []) if isinstance(v, (int, float, str)) and str(v).strip() != '']
+def calculer_diagnostic(valeurs, n_prevision=3):
     n = len(valeurs)
-    n_prevision = payload.get('n_prevision', 3)
-    try:
-        n_prevision = max(1, min(int(n_prevision), 12))
-    except (TypeError, ValueError):
-        n_prevision = 3
-
     if n < 2:
-        return jsonify({'erreur': "Pas assez de données exploitables pour une analyse statistique (2 points minimum)."}), 400
+        return {'erreur': "Pas assez de données exploitables pour une analyse statistique (2 points minimum)."}
 
     reg = regression_lineaire(valeurs)
     croiss = croissance(valeurs)
+    avg_value = float(np.mean(valeurs))
+
+    # Même seuil que l'ancien outil (Cabinet HC) : pente relative à la valeur moyenne
+    relative_slope = (reg['pente'] / abs(avg_value)) if avg_value else 0.0
+    if relative_slope > 0.01:
+        tendance_qualitative = 'Hausse'
+    elif relative_slope < -0.01:
+        tendance_qualitative = 'Baisse'
+    else:
+        tendance_qualitative = 'Stable'
 
     if n < 8:
         methode = 'regression_lineaire_simple'
@@ -282,14 +279,89 @@ def analyser_serie():
         raison = f"Série de {n} points (au moins 2 cycles complets) : une décomposition saisonnière additive permet de distinguer la vraie tendance de fond d'un effet saisonnier récurrent."
         details_methode = decomposition_saisonniere_additive(valeurs, n_prevision=n_prevision)
 
-    return jsonify({
+    return {
         'n_points': n,
         'methode_choisie': methode,
         'raison_du_choix': raison,
+        'tendance_qualitative': tendance_qualitative,
+        'valeur_moyenne': avg_value,
         'tendance_lineaire': reg,
         'croissance': croiss,
         'resultats_methode_choisie': details_methode,
-    })
+    }
+
+
+@app.route('/analyser-serie', methods=['POST'])
+def analyser_serie():
+    payload = request.get_json(force=True, silent=True) or {}
+    serie = payload.get('serie') or []
+    valeurs = [p.get('value') for p in serie if isinstance(p.get('value'), (int, float))]
+    if not valeurs and payload.get('valeurs'):
+        # Format simplifié : {"valeurs": [1200, 1300, ...]} — pratique depuis Make/no-code
+        valeurs = [float(v) for v in payload.get('valeurs', []) if isinstance(v, (int, float, str)) and str(v).strip() != '']
+    n_prevision = payload.get('n_prevision', 3)
+    try:
+        n_prevision = max(1, min(int(n_prevision), 12))
+    except (TypeError, ValueError):
+        n_prevision = 3
+
+    resultat = calculer_diagnostic(valeurs, n_prevision)
+    if 'erreur' in resultat:
+        return jsonify(resultat), 400
+    return jsonify(resultat)
+
+
+@app.route('/analyser-fichier', methods=['OPTIONS'])
+def preflight_fichier():
+    return ('', 204)
+
+
+@app.route('/analyser-fichier', methods=['POST'])
+def analyser_fichier():
+    """
+    Reçoit directement le texte brut d'un fichier CSV (colonnes Date, Montant —
+    voir Gabarit_Diagnostic_Flash.csv) et fait tout le travail ici : parsing,
+    détection de colonne, calcul de tendance. Pensé pour être appelé depuis un
+    scénario Make sans logique de parsing côté no-code.
+    Corps attendu : {"csv_text": "Date,Montant\\n2026-01-01,450000\\n...", "n_prevision": 3}
+    """
+    payload = request.get_json(force=True, silent=True) or {}
+    csv_text = payload.get('csv_text', '')
+    if not csv_text.strip():
+        return jsonify({'erreur': "Aucun contenu de fichier reçu (champ 'csv_text' vide)."}), 400
+
+    n_prevision = payload.get('n_prevision', 3)
+    try:
+        n_prevision = max(1, min(int(n_prevision), 12))
+    except (TypeError, ValueError):
+        n_prevision = 3
+
+    try:
+        import io
+        df = pd.read_csv(io.StringIO(csv_text))
+    except Exception as e:
+        return jsonify({'erreur': f"Impossible de lire le fichier comme un CSV valide : {e}"}), 400
+
+    # Détection de la colonne de montants : nom explicite, sinon colonne la plus numérique
+    montant_col = None
+    for col in df.columns:
+        if re.search(r'montant|vente|revenu|valeur|^ca$|sales|amount|revenue|chiffre', str(col), re.IGNORECASE):
+            montant_col = col
+            break
+    if montant_col is None:
+        numeric_cols = df.select_dtypes(include='number').columns.tolist()
+        if numeric_cols:
+            montant_col = numeric_cols[0]
+
+    if montant_col is None:
+        return jsonify({'erreur': "Aucune colonne de montants détectée dans le fichier. Vérifiez le gabarit (colonnes 'Date' et 'Montant')."}), 400
+
+    valeurs = pd.to_numeric(df[montant_col], errors='coerce').dropna().tolist()
+    resultat = calculer_diagnostic(valeurs, n_prevision)
+    if 'erreur' in resultat:
+        return jsonify(resultat), 400
+    resultat['colonne_utilisee'] = str(montant_col)
+    return jsonify(resultat)
 
 
 if __name__ == '__main__':
