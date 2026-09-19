@@ -29,9 +29,11 @@ méthode doit être simple pour éviter de "voir" des motifs qui n'existent pas)
                           changement de tendance d'un simple effet saisonnier récurrent)
 """
 
+import os
 from flask import Flask, request, jsonify
 import numpy as np
 import pandas as pd
+import requests
 
 app = Flask(__name__)
 
@@ -311,37 +313,17 @@ def analyser_serie():
     return jsonify(resultat)
 
 
-@app.route('/analyser-fichier', methods=['OPTIONS'])
-def preflight_fichier():
-    return ('', 204)
-
-
-@app.route('/analyser-fichier', methods=['POST'])
-def analyser_fichier():
-    """
-    Reçoit directement le texte BRUT d'un fichier CSV dans le corps de la requête
-    (Content-Type: text/plain ou text/csv — pas de JSON), colonnes Date, Montant
-    (voir Gabarit_Diagnostic_Flash.csv). Fait tout le travail ici : parsing,
-    détection de colonne, calcul de tendance. Pensé pour un appel HTTP direct
-    depuis Make, sans logique de parsing côté no-code.
-    Paramètre optionnel en query string : ?n_prevision=3
-    """
-    csv_text = request.get_data(as_text=True) or ''
+def diagnostiquer_csv(csv_text, n_prevision=3):
+    """Prend le texte brut d'un CSV (colonnes Date, Montant) et retourne le diagnostic complet."""
     if not csv_text.strip():
-        return jsonify({'erreur': "Aucun contenu de fichier reçu (corps de requête vide)."}), 400
-
-    try:
-        n_prevision = max(1, min(int(request.args.get('n_prevision', 3)), 12))
-    except (TypeError, ValueError):
-        n_prevision = 3
+        return {'erreur': "Aucun contenu de fichier reçu (corps de requête vide)."}, 400
 
     try:
         import io
         df = pd.read_csv(io.StringIO(csv_text))
     except Exception as e:
-        return jsonify({'erreur': f"Impossible de lire le fichier comme un CSV valide : {e}"}), 400
+        return {'erreur': f"Impossible de lire le fichier comme un CSV valide : {e}"}, 400
 
-    # Détection de la colonne de montants : nom explicite, sinon colonne la plus numérique
     montant_col = None
     for col in df.columns:
         if re.search(r'montant|vente|revenu|valeur|^ca$|sales|amount|revenue|chiffre', str(col), re.IGNORECASE):
@@ -353,14 +335,94 @@ def analyser_fichier():
             montant_col = numeric_cols[0]
 
     if montant_col is None:
-        return jsonify({'erreur': "Aucune colonne de montants détectée dans le fichier. Vérifiez le gabarit (colonnes 'Date' et 'Montant')."}), 400
+        return {'erreur': "Aucune colonne de montants détectée dans le fichier. Vérifiez le gabarit (colonnes 'Date' et 'Montant')."}, 400
 
     valeurs = pd.to_numeric(df[montant_col], errors='coerce').dropna().tolist()
     resultat = calculer_diagnostic(valeurs, n_prevision)
     if 'erreur' in resultat:
-        return jsonify(resultat), 400
+        return resultat, 400
     resultat['colonne_utilisee'] = str(montant_col)
-    return jsonify(resultat)
+    return resultat, 200
+
+
+@app.route('/analyser-fichier', methods=['OPTIONS'])
+def preflight_fichier():
+    return ('', 204)
+
+
+@app.route('/analyser-fichier', methods=['POST'])
+def analyser_fichier():
+    """
+    Reçoit directement le texte BRUT d'un fichier CSV dans le corps de la requête
+    (Content-Type: text/plain ou text/csv — pas de JSON), colonnes Date, Montant
+    (voir Gabarit_Diagnostic_Flash.csv). Paramètre optionnel en query string : ?n_prevision=3
+    """
+    csv_text = request.get_data(as_text=True) or ''
+    try:
+        n_prevision = max(1, min(int(request.args.get('n_prevision', 3)), 12))
+    except (TypeError, ValueError):
+        n_prevision = 3
+
+    resultat, code = diagnostiquer_csv(csv_text, n_prevision)
+    return jsonify(resultat), code
+
+
+# --- Configuration fixe de l'intégration Airtable (base H-Engine) ---
+AIRTABLE_BASE_ID = 'app9r44N1ljXhhvU5'
+AIRTABLE_TABLE_ID = 'tblemImN7VmnH5SRM'
+AIRTABLE_FIELD_ATTACHMENT = 'fldaezqrIIWVik3zP'  # Fichier de ventes (brut)
+
+
+@app.route('/analyser-depot', methods=['OPTIONS'])
+def preflight_depot():
+    return ('', 204)
+
+
+@app.route('/analyser-depot', methods=['POST'])
+def analyser_depot():
+    """
+    Reçoit juste l'ID d'un enregistrement Airtable ({"record_id": "recXXXX"}),
+    va chercher lui-même le fichier de ventes déposé sur cet enregistrement
+    (en appelant l'API Airtable avec un token de lecture seule), puis fait
+    tout le diagnostic. Pensé pour contourner les limites de Make sur
+    l'extraction d'URL de pièce jointe depuis un scénario no-code.
+    """
+    token = os.environ.get('AIRTABLE_TOKEN', '')
+    if not token:
+        return jsonify({'erreur': "AIRTABLE_TOKEN n'est pas configuré sur le service."}), 500
+
+    payload = request.get_json(force=True, silent=True) or {}
+    record_id = payload.get('record_id', '').strip()
+    if not record_id:
+        return jsonify({'erreur': "Le champ 'record_id' est requis."}), 400
+
+    try:
+        n_prevision = max(1, min(int(payload.get('n_prevision', 3)), 12))
+    except (TypeError, ValueError):
+        n_prevision = 3
+
+    record_url = f'https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{AIRTABLE_TABLE_ID}/{record_id}'
+    try:
+        r = requests.get(record_url, headers={'Authorization': f'Bearer {token}'}, timeout=20)
+        r.raise_for_status()
+        record = r.json()
+    except Exception as e:
+        return jsonify({'erreur': f"Impossible de récupérer l'enregistrement Airtable : {e}"}), 502
+
+    attachments = record.get('fields', {}).get(AIRTABLE_FIELD_ATTACHMENT) or []
+    if not attachments:
+        return jsonify({'erreur': "Aucun fichier de ventes déposé sur cet enregistrement."}), 400
+
+    file_url = attachments[0].get('url')
+    try:
+        file_resp = requests.get(file_url, timeout=20)
+        file_resp.raise_for_status()
+        csv_text = file_resp.content.decode('utf-8', errors='replace')
+    except Exception as e:
+        return jsonify({'erreur': f"Impossible de télécharger le fichier déposé : {e}"}), 502
+
+    resultat, code = diagnostiquer_csv(csv_text, n_prevision)
+    return jsonify(resultat), code
 
 
 if __name__ == '__main__':
